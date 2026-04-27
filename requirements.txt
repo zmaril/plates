@@ -1,4 +1,4 @@
-scipy
+streamlit
 numpy
 matplotlib
-itertools
+scipy
