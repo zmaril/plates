@@ -11,6 +11,24 @@ plt.rcParams["mathtext.fontset"] = "stix"
 plt.rcParams["font.family"] = "serif"
 
 
+# ---------- Material / plate physics ----------
+
+MATERIALS = {
+    "Aluminum": {"E": 69e9,  "nu": 0.33, "rho": 2700.0},
+    "Steel":    {"E": 200e9, "nu": 0.30, "rho": 7850.0},
+    "Brass":    {"E": 100e9, "nu": 0.34, "rho": 8500.0},
+}
+
+
+def flexural_rigidity(E, nu, h):
+    return E * h**3 / (12.0 * (1.0 - nu**2))
+
+
+def plate_speed(E, nu, rho, h):
+    """sqrt(D/(rho h)) — common prefactor in every plate frequency."""
+    return np.sqrt(flexural_rigidity(E, nu, h) / (rho * h))
+
+
 # ---------- Cartesian helpers ----------
 
 def X_basis(x, n):
@@ -36,7 +54,14 @@ def sign_combos(pairs):
     return [[1] + list(c) for c in combos]
 
 
-def square_variants_for_S(S):
+def _center_value_square(pairs, signs):
+    # X(0, n) = 1 if n is even, else 0. A (n,m) pair contributes to u(0,0)
+    # only when both n and m are even; the sign sum decides if it cancels.
+    return sum(s for (n, m), s in zip(pairs, signs)
+               if n % 2 == 0 and m % 2 == 0)
+
+
+def square_variants_for_S(S, center_pinned=True):
     pairs = find_pairs(S)
     if not pairs:
         return []
@@ -44,20 +69,20 @@ def square_variants_for_S(S):
     non_zero = pairs[1:-1]
     if non_zero:
         variants.extend((non_zero, signs) for signs in sign_combos(non_zero))
+    if center_pinned:
+        variants = [v for v in variants if _center_value_square(*v) == 0]
     return variants
 
 
 @st.cache_data(show_spinner=False)
-def all_valid_S(max_S=300):
-    return [k for k in range(1, max_S + 1)
-            if any(n * n + m * m == k
-                   for n in range(int(np.sqrt(k)) + 1)
-                   for m in range(int(np.sqrt(k)) + 1))]
+def all_valid_S(max_S=300, center_pinned=True):
+    return [k for k in range(1, max_S + 1) if square_variants_for_S(k, center_pinned)]
 
 
-def square_freq(c, a, S):
-    # Plate x,y ∈ [-a, a]; eigenvalue (π/(2a))²·(n²+m²); ω = c·k; f = c·√S/(4a)
-    return c * np.sqrt(S) / (4 * a)
+def square_freq(E, nu, rho, h, a, S):
+    # Thin-plate biharmonic, simply-supported eigenvalue k² = (π/(2a))²·S
+    # ω² = k⁴·D/(ρh)  ⇒  f = (π/(8a²))·S·√(D/(ρh))
+    return (np.pi * S) / (8.0 * a**2) * plate_speed(E, nu, rho, h)
 
 
 # ---------- Polar helpers ----------
@@ -71,18 +96,21 @@ def bessel_deriv_zero(n, m):
 
 
 @st.cache_data(show_spinner=False)
-def polar_mode_table(n_max=15, m_max=10):
+def polar_mode_table(n_max=15, m_max=10, center_pinned=True):
+    # n=0 modes (axisymmetric "rings") have an antinode at r=0, so a plate
+    # pinned at its center can't support them. n≥1 modes vanish at r=0.
+    n_start = 1 if center_pinned else 0
     out = []
-    for n in range(n_max):
+    for n in range(n_start, n_max):
         for m in range(m_max):
             z = float(bessel_deriv_zero(n, m))
             out.append((n, m, z))
     return sorted(out, key=lambda x: x[2])
 
 
-def polar_freq(c, a, z):
-    # ω = c·z_nm/a; f = c·z_nm/(2π·a)
-    return c * z / (2 * np.pi * a)
+def polar_freq(E, nu, rho, h, a, z):
+    # f = z²/(2π·a²) · √(D/(ρh))
+    return (z ** 2) / (2.0 * np.pi * a ** 2) * plate_speed(E, nu, rho, h)
 
 
 def f_polar(r, theta):
@@ -177,25 +205,45 @@ contour_color_name = st.sidebar.radio(
 thickness = st.sidebar.slider("Line thickness", 0.5, 3.0, 1.5, 0.1)
 
 with st.sidebar.expander("Advanced", expanded=False):
-    c = st.number_input("Wave speed c (m/s)", min_value=1.0, max_value=10000.0,
-                        value=100.0, step=10.0)
+    material_name = st.selectbox(
+        "Material", list(MATERIALS.keys()) + ["Custom"], index=0,
+    )
+    if material_name == "Custom":
+        E = st.number_input("Young's modulus E (GPa)",
+                            min_value=1.0, max_value=1000.0,
+                            value=69.0, step=1.0) * 1e9
+        nu = st.number_input("Poisson's ratio ν",
+                             min_value=0.0, max_value=0.5,
+                             value=0.33, step=0.01)
+        rho = st.number_input("Density ρ (kg/m³)",
+                              min_value=100.0, max_value=20000.0,
+                              value=2700.0, step=100.0)
+    else:
+        preset = MATERIALS[material_name]
+        E, nu, rho = preset["E"], preset["nu"], preset["rho"]
+        st.caption(f"E = {E/1e9:.0f} GPa,  ν = {nu},  ρ = {rho:.0f} kg/m³")
+    h = st.number_input("Thickness h (mm)", min_value=0.1, max_value=20.0,
+                        value=1.0, step=0.1) / 1000.0
     a_label = "Half-side a (m)" if shape == "Square" else "Radius a (m)"
     a = st.number_input(a_label, min_value=0.01, max_value=2.0,
                         value=0.1, step=0.01, format="%.3f")
+    center_pinned = st.checkbox(
+        "Center-pinned (matches Chladni setup)", value=True,
+    )
     variant_slot = st.empty()
 
 plate_color = COLOR_OPTIONS[plate_color_name]
 contour_color = COLOR_OPTIONS[contour_color_name]
 
 if shape == "Square":
-    valid_S = all_valid_S(300)
-    f_min = square_freq(c, a, valid_S[0])
-    f_max = square_freq(c, a, valid_S[-1])
+    valid_S = all_valid_S(300, center_pinned)
+    f_min = square_freq(E, nu, rho, h, a, valid_S[0])
+    f_max = square_freq(E, nu, rho, h, a, valid_S[-1])
 else:
-    table = polar_mode_table()
+    table = polar_mode_table(center_pinned=center_pinned)
     nontrivial = [row for row in table if row[2] > 0]
-    f_min = polar_freq(c, a, nontrivial[0][2])
-    f_max = polar_freq(c, a, table[-1][2])
+    f_min = polar_freq(E, nu, rho, h, a, nontrivial[0][2])
+    f_max = polar_freq(E, nu, rho, h, a, table[-1][2])
 
 fmin_i = int(np.floor(f_min))
 fmax_i = max(int(np.ceil(f_max)), fmin_i + 1)
@@ -204,9 +252,9 @@ fmax_i = max(int(np.ceil(f_max)), fmin_i + 1)
 # number_input's +/- buttons to step to the next or previous mode rather than
 # moving by 1 Hz (which usually maps to the same mode anyway).
 if shape == "Square":
-    mode_hz = sorted({int(round(square_freq(c, a, S))) for S in valid_S})
+    mode_hz = sorted({int(round(square_freq(E, nu, rho, h, a, S))) for S in valid_S})
 else:
-    mode_hz = sorted({int(round(polar_freq(c, a, z))) for _, _, z in nontrivial})
+    mode_hz = sorted({int(round(polar_freq(E, nu, rho, h, a, z))) for _, _, z in nontrivial})
 mode_hz = [m for m in mode_hz if fmin_i <= m <= fmax_i]
 st.session_state._mode_hz = mode_hz  # exposed to callbacks
 
@@ -257,11 +305,13 @@ exact_slot.number_input(
 )
 freq = int(st.session_state._freq_slider)
 
+cp = plate_speed(E, nu, rho, h)
+
 if shape == "Square":
-    target_S = (4 * a * freq / c) ** 2
+    target_S = 8.0 * a**2 * freq / (np.pi * cp)
     S = min(valid_S, key=lambda s: abs(s - target_S))
-    actual_freq = square_freq(c, a, S)
-    variants = square_variants_for_S(S)
+    actual_freq = square_freq(E, nu, rho, h, a, S)
+    variants = square_variants_for_S(S, center_pinned)
 
     if len(variants) > 1:
         variant_idx = variant_slot.slider(
@@ -281,12 +331,12 @@ if shape == "Square":
     c2.metric("Mode S = n²+m²", str(S))
     c3.metric("Variant", f"{variant_idx + 1} / {len(variants)}")
     st.caption(f"(n,m) pairs: `{pairs}` · signs: `{signs}`")
-    st.caption(r"$f = \dfrac{c}{4a}\sqrt{n^2+m^2}$")
+    st.caption(r"$f = \dfrac{\pi (n^2+m^2)}{8 a^2}\,\sqrt{D/(\rho h)},\quad D = \dfrac{E h^3}{12(1-\nu^2)}$")
 
 else:
-    target_z = 2 * np.pi * a * freq / c
+    target_z = float(np.sqrt(max(2.0 * np.pi * a**2 * freq / cp, 0.0)))
     n, m, z = min(nontrivial, key=lambda row: abs(row[2] - target_z))
-    actual_freq = polar_freq(c, a, z)
+    actual_freq = polar_freq(E, nu, rho, h, a, z)
 
     fig = render_one_polar(n, m, plate_color=plate_color,
                            contour_color=contour_color, thickness=thickness)
@@ -296,4 +346,4 @@ else:
     c1.metric("Resonant freq", f"{actual_freq:.1f} Hz")
     c2.metric("(n, m)", f"({n}, {m})")
     c3.metric("Bessel zero z_{n,m}", f"{z:.3f}")
-    st.caption(r"$f = \dfrac{c \, z_{n,m}}{2\pi a}$")
+    st.caption(r"$f = \dfrac{z_{n,m}^2}{2\pi a^2}\,\sqrt{D/(\rho h)}$")
