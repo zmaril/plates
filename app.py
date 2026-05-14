@@ -6,7 +6,7 @@ import scipy.integrate as integrate
 import streamlit as st
 from scipy.special import jn, jnp_zeros
 
-st.set_page_config(page_title="Chladni Patterns Generator", layout="centered")
+st.set_page_config(page_title="Chladni Patterns Generator", layout="wide")
 plt.rcParams["mathtext.fontset"] = "stix"
 plt.rcParams["font.family"] = "serif"
 
@@ -48,7 +48,7 @@ def square_variants_for_S(S):
 
 
 @st.cache_data(show_spinner=False)
-def all_valid_S(max_S=300):
+def all_valid_S(max_S=500):
     return [k for k in range(1, max_S + 1)
             if any(n * n + m * m == k
                    for n in range(int(np.sqrt(k)) + 1)
@@ -115,14 +115,18 @@ def polar_field(n, m, resolution=120):
 
 # ---------- Renderers (one diagram) ----------
 
-def render_one_square(pairs, signs, *, plate_color, contour_color, thickness, delta=0.005):
+def render_one_square(pairs, signs, *, plate_color, contour_color, thickness,
+                      delta=0.005, figsize=(6, 6), bg_color=None):
     xrange = np.arange(-1.0, 1.0, delta)
     yrange = np.arange(-1.0, 1.0, delta)
     x, y = np.meshgrid(xrange, yrange)
     eq = u_square(x, y, pairs, signs)
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    fig.patch.set_alpha(0)  # transparent fig bg — only the square plate is visible
+    fig, ax = plt.subplots(figsize=figsize)
+    if bg_color is None:
+        fig.patch.set_alpha(0)  # transparent — only the plate is visible
+    else:
+        fig.patch.set_facecolor(bg_color)
     ax.set_facecolor(plate_color)
     ax.contour(x, y, eq, levels=[0], colors=contour_color, linewidths=thickness)
     ax.set_aspect("equal")
@@ -133,10 +137,14 @@ def render_one_square(pairs, signs, *, plate_color, contour_color, thickness, de
     return fig
 
 
-def render_one_polar(n, m, *, plate_color, contour_color, thickness):
+def render_one_polar(n, m, *, plate_color, contour_color, thickness, figsize=(6, 6),
+                     bg_color=None):
     T, R, Z = polar_field(n, m)
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw={"projection": "polar"})
-    fig.patch.set_alpha(0)  # transparent fig bg — only the disk is visible
+    fig, ax = plt.subplots(figsize=figsize, subplot_kw={"projection": "polar"})
+    if bg_color is None:
+        fig.patch.set_alpha(0)  # transparent — only the disk is visible
+    else:
+        fig.patch.set_facecolor(bg_color)
     ax.set_facecolor(plate_color)
     ax.contour(T, R, Z, levels=[0], colors=contour_color, linewidths=thickness)
     ax.set_xticks([])
@@ -145,6 +153,42 @@ def render_one_polar(n, m, *, plate_color, contour_color, thickness):
     for spine in ax.spines.values():
         spine.set_visible(False)
     return fig
+
+
+# ---------- List-view helpers ----------
+
+DEFAULT_FREQ_LIST = (
+    "174, 285, 396, 417, 432, 473, 528, 639, 697, 741, 852, 963,\n"
+    "1053, 1176, 1500, 1820, 2222, 2473, 3333, 3370, 3975, 4254, 4444"
+)
+
+
+def parse_freq_list(text):
+    out, seen = [], set()
+    for tok in text.replace("\n", ",").replace(";", ",").split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            v = int(round(float(tok)))
+        except ValueError:
+            continue
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def square_snap(freq, c, a, valid_S):
+    target_S = (4 * a * freq / c) ** 2
+    S = min(valid_S, key=lambda s: abs(s - target_S))
+    return S, square_freq(c, a, S)
+
+
+def polar_snap(freq, c, a, nontrivial):
+    target_z = 2 * np.pi * a * freq / c
+    n, m, z = min(nontrivial, key=lambda r: abs(r[2] - target_z))
+    return n, m, z, polar_freq(c, a, z)
 
 
 # ---------- UI ----------
@@ -162,10 +206,19 @@ COLOR_NAMES = list(COLOR_OPTIONS)
 st.title("Chladni Patterns Generator")
 st.caption("Drive the plate at a real frequency — the closest natural mode lights up.")
 
-# Reserve slots at the top of the sidebar so the Hz controls render above the
-# inputs that determine their range.
+view_mode = st.sidebar.radio("View", ["Single frequency", "Frequency list"])
+
+# Slots reserved so the single-mode Hz controls render above the inputs that
+# determine their range. Stay empty in list mode.
 freq_slot = st.sidebar.empty()
 exact_slot = st.sidebar.empty()
+
+if view_mode == "Frequency list":
+    freq_text = st.sidebar.text_area(
+        "Frequencies (Hz)", value=DEFAULT_FREQ_LIST, height=180,
+        help="Comma- or newline-separated integers.",
+    )
+    n_cols = st.sidebar.slider("Grid columns", 2, 6, 4)
 
 shape = st.sidebar.radio("Plate shape", ["Square", "Circular"])
 plate_color_name = st.sidebar.radio(
@@ -188,7 +241,7 @@ plate_color = COLOR_OPTIONS[plate_color_name]
 contour_color = COLOR_OPTIONS[contour_color_name]
 
 if shape == "Square":
-    valid_S = all_valid_S(300)
+    valid_S = all_valid_S(500)
     f_min = square_freq(c, a, valid_S[0])
     f_max = square_freq(c, a, valid_S[-1])
 else:
@@ -200,100 +253,160 @@ else:
 fmin_i = int(np.floor(f_min))
 fmax_i = max(int(np.ceil(f_max)), fmin_i + 1)
 
-# All resonant frequencies (integer Hz) for the current shape/c/a — used by the
-# number_input's +/- buttons to step to the next or previous mode rather than
-# moving by 1 Hz (which usually maps to the same mode anyway).
-if shape == "Square":
-    mode_hz = sorted({int(round(square_freq(c, a, S))) for S in valid_S})
-else:
-    mode_hz = sorted({int(round(polar_freq(c, a, z))) for _, _, z in nontrivial})
-mode_hz = [m for m in mode_hz if fmin_i <= m <= fmax_i]
-st.session_state._mode_hz = mode_hz  # exposed to callbacks
 
-# Linked slider + number_input for Hz: editing one updates the other.
-DEFAULT_FREQ = 1223
-if "_freq_slider" not in st.session_state:
-    st.session_state._freq_slider = DEFAULT_FREQ
-    st.session_state._freq_input = DEFAULT_FREQ
-
-st.session_state._freq_slider = max(fmin_i, min(fmax_i, int(st.session_state._freq_slider)))
-st.session_state._freq_input = max(fmin_i, min(fmax_i, int(st.session_state._freq_input)))
-
-
-def _sync_from_slider():
-    st.session_state._freq_input = st.session_state._freq_slider
-
-
-def _sync_from_input():
-    new_val = int(st.session_state._freq_input)
-    ref = int(st.session_state._freq_slider)
-    modes = st.session_state.get("_mode_hz", [])
-    if modes and new_val == ref + 1:
-        # +-button click — jump to the next resonant mode above ref.
-        nxt = [f for f in modes if f > ref]
-        target = nxt[0] if nxt else modes[-1]
-        st.session_state._freq_input = target
-        st.session_state._freq_slider = target
-    elif modes and new_val == ref - 1:
-        # −-button click — jump to the previous resonant mode below ref.
-        prv = [f for f in modes if f < ref]
-        target = prv[-1] if prv else modes[0]
-        st.session_state._freq_input = target
-        st.session_state._freq_slider = target
+if view_mode == "Single frequency":
+    # All resonant frequencies (integer Hz) for the current shape/c/a — used by
+    # the number_input's +/- buttons to step to the next or previous mode rather
+    # than moving by 1 Hz (which usually maps to the same mode anyway).
+    if shape == "Square":
+        mode_hz = sorted({int(round(square_freq(c, a, S))) for S in valid_S})
     else:
-        # Typed value — take it as-is; the diagram still snaps to the nearest mode.
-        st.session_state._freq_slider = new_val
+        mode_hz = sorted({int(round(polar_freq(c, a, z))) for _, _, z in nontrivial})
+    mode_hz = [m for m in mode_hz if fmin_i <= m <= fmax_i]
+    st.session_state._mode_hz = mode_hz
 
+    DEFAULT_FREQ = 1223
+    if "_freq_slider" not in st.session_state:
+        st.session_state._freq_slider = DEFAULT_FREQ
+        st.session_state._freq_input = DEFAULT_FREQ
 
-freq_slot.slider(
-    "Frequency (Hz)",
-    min_value=fmin_i, max_value=fmax_i, step=1,
-    key="_freq_slider", on_change=_sync_from_slider,
-)
-exact_slot.number_input(
-    "Or type exact (Hz)",
-    min_value=fmin_i, max_value=fmax_i, step=1,
-    key="_freq_input", on_change=_sync_from_input,
-)
-freq = int(st.session_state._freq_slider)
+    st.session_state._freq_slider = max(fmin_i, min(fmax_i, int(st.session_state._freq_slider)))
+    st.session_state._freq_input = max(fmin_i, min(fmax_i, int(st.session_state._freq_input)))
 
-if shape == "Square":
-    target_S = (4 * a * freq / c) ** 2
-    S = min(valid_S, key=lambda s: abs(s - target_S))
-    actual_freq = square_freq(c, a, S)
-    variants = square_variants_for_S(S)
+    def _sync_from_slider():
+        st.session_state._freq_input = st.session_state._freq_slider
 
-    if len(variants) > 1:
-        variant_idx = variant_slot.slider(
-            f"Degenerate variant (1–{len(variants)})",
-            1, len(variants), 1, key=f"variant_S{S}",
-        ) - 1
+    def _sync_from_input():
+        new_val = int(st.session_state._freq_input)
+        ref = int(st.session_state._freq_slider)
+        modes = st.session_state.get("_mode_hz", [])
+        if modes and new_val == ref + 1:
+            nxt = [f for f in modes if f > ref]
+            target = nxt[0] if nxt else modes[-1]
+            st.session_state._freq_input = target
+            st.session_state._freq_slider = target
+        elif modes and new_val == ref - 1:
+            prv = [f for f in modes if f < ref]
+            target = prv[-1] if prv else modes[0]
+            st.session_state._freq_input = target
+            st.session_state._freq_slider = target
+        else:
+            st.session_state._freq_slider = new_val
+
+    freq_slot.slider(
+        "Frequency (Hz)",
+        min_value=fmin_i, max_value=fmax_i, step=1,
+        key="_freq_slider", on_change=_sync_from_slider,
+    )
+    exact_slot.number_input(
+        "Or type exact (Hz)",
+        min_value=fmin_i, max_value=fmax_i, step=1,
+        key="_freq_input", on_change=_sync_from_input,
+    )
+    freq = int(st.session_state._freq_slider)
+
+    if shape == "Square":
+        S, actual_freq = square_snap(freq, c, a, valid_S)
+        variants = square_variants_for_S(S)
+        if len(variants) > 1:
+            variant_idx = variant_slot.slider(
+                f"Degenerate variant (1–{len(variants)})",
+                1, len(variants), 1, key=f"variant_S{S}",
+            ) - 1
+        else:
+            variant_idx = 0
+        pairs, signs = variants[variant_idx]
+
+        fig = render_one_square(pairs, signs, plate_color=plate_color,
+                                contour_color=contour_color, thickness=thickness)
+        st.pyplot(fig)
+        plt.close(fig)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Resonant freq", f"{actual_freq:.1f} Hz")
+        c2.metric("Mode S = n²+m²", str(S))
+        c3.metric("Variant", f"{variant_idx + 1} / {len(variants)}")
+        st.caption(f"(n,m) pairs: `{pairs}` · signs: `{signs}`")
+        st.caption(r"$f = \dfrac{c}{4a}\sqrt{n^2+m^2}$")
+
     else:
-        variant_idx = 0
-    pairs, signs = variants[variant_idx]
+        n, m, z, actual_freq = polar_snap(freq, c, a, nontrivial)
+        fig = render_one_polar(n, m, plate_color=plate_color,
+                               contour_color=contour_color, thickness=thickness)
+        st.pyplot(fig)
+        plt.close(fig)
 
-    fig = render_one_square(pairs, signs, plate_color=plate_color,
-                            contour_color=contour_color, thickness=thickness)
-    st.pyplot(fig)
-
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Resonant freq", f"{actual_freq:.1f} Hz")
-    c2.metric("Mode S = n²+m²", str(S))
-    c3.metric("Variant", f"{variant_idx + 1} / {len(variants)}")
-    st.caption(f"(n,m) pairs: `{pairs}` · signs: `{signs}`")
-    st.caption(r"$f = \dfrac{c}{4a}\sqrt{n^2+m^2}$")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Resonant freq", f"{actual_freq:.1f} Hz")
+        c2.metric("(n, m)", f"({n}, {m})")
+        c3.metric("Bessel zero z_{n,m}", f"{z:.3f}")
+        st.caption(r"$f = \dfrac{c \, z_{n,m}}{2\pi a}$")
 
 else:
-    target_z = 2 * np.pi * a * freq / c
-    n, m, z = min(nontrivial, key=lambda row: abs(row[2] - target_z))
-    actual_freq = polar_freq(c, a, z)
+    # ---------- Frequency list view ----------
+    freqs = parse_freq_list(freq_text)
+    if not freqs:
+        st.info("Enter at least one frequency in the sidebar.")
+    else:
+        oob_set = {f for f in freqs if f < fmin_i or f > fmax_i}
+        if oob_set:
+            st.markdown(
+                f"<div style='background:#ffd6d6;border:2px solid #d33;"
+                f"border-radius:8px;padding:1rem 1.25rem;margin:0.5rem 0 1rem;"
+                f"font-size:1.4rem;font-weight:600;color:#7a0000;'>"
+                f"<span style='font-size:2rem;'>🚨</span>&nbsp;"
+                f"{len(oob_set)} value(s) outside the resonant range "
+                f"[{fmin_i}, {fmax_i}] Hz will snap to the nearest available mode."
+                f"&nbsp;<span style='font-size:2rem;'>🚨</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        OOB_BG = "#ffd6d6"
 
-    fig = render_one_polar(n, m, plate_color=plate_color,
-                           contour_color=contour_color, thickness=thickness)
-    st.pyplot(fig)
+        for row_start in range(0, len(freqs), n_cols):
+            row = st.columns(n_cols)
+            for col, target in zip(row, freqs[row_start:row_start + n_cols]):
+                with col:
+                    is_oob = target in oob_set
+                    bg = OOB_BG if is_oob else None
+                    if shape == "Square":
+                        S, actual_freq = square_snap(target, c, a, valid_S)
+                        variants = square_variants_for_S(S)
+                        key = f"vidx_sq_{target}"
+                        idx = st.session_state.get(key, 0) % max(1, len(variants))
+                        pairs, signs = variants[idx]
+                        fig = render_one_square(
+                            pairs, signs,
+                            plate_color=plate_color, contour_color=contour_color,
+                            thickness=thickness, figsize=(3, 3), bg_color=bg,
+                        )
+                        sub = f"S={S} · {idx + 1}/{len(variants)}"
+                        n_variants = len(variants)
+                    else:
+                        n, m, z, actual_freq = polar_snap(target, c, a, nontrivial)
+                        key = f"vidx_pol_{n}_{m}"
+                        fig = render_one_polar(
+                            n, m,
+                            plate_color=plate_color, contour_color=contour_color,
+                            thickness=thickness, figsize=(3, 3), bg_color=bg,
+                        )
+                        sub = f"(n,m)=({n},{m})"
+                        n_variants = 1
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Resonant freq", f"{actual_freq:.1f} Hz")
-    c2.metric("(n, m)", f"({n}, {m})")
-    c3.metric("Bessel zero z_{n,m}", f"{z:.3f}")
-    st.caption(r"$f = \dfrac{c \, z_{n,m}}{2\pi a}$")
+                    label = f"**{target} Hz** → {actual_freq:.0f} Hz · {sub}"
+                    if is_oob:
+                        label = f"🚨 {label}"
+                    st.markdown(label)
+                    st.pyplot(fig)
+                    plt.close(fig)
+
+                    if n_variants > 1:
+                        bcols = st.columns(2)
+                        if bcols[0].button("◀", key=f"prev_{key}_{target}",
+                                           use_container_width=True):
+                            st.session_state[key] = (idx - 1) % n_variants
+                            st.rerun()
+                        if bcols[1].button("▶", key=f"next_{key}_{target}",
+                                           use_container_width=True):
+                            st.session_state[key] = (idx + 1) % n_variants
+                            st.rerun()
