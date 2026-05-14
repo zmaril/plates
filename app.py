@@ -11,6 +11,26 @@ plt.rcParams["mathtext.fontset"] = "stix"
 plt.rcParams["font.family"] = "serif"
 
 
+# ---------- Material / plate physics ----------
+# Kirchhoff–Love thin plate, simply-supported edges. Frequencies follow
+# f ∝ k² · √(D/(ρh)), where D = E h³ / (12(1 − ν²)).
+
+MATERIALS = {
+    "Aluminum": {"E": 69e9,  "nu": 0.33, "rho": 2700.0},
+    "Steel":    {"E": 200e9, "nu": 0.30, "rho": 7850.0},
+    "Brass":    {"E": 100e9, "nu": 0.34, "rho": 8500.0},
+}
+
+
+def flexural_rigidity(E, nu, h):
+    return E * h**3 / (12.0 * (1.0 - nu**2))
+
+
+def plate_speed(E, nu, rho, h):
+    """sqrt(D/(ρh)) — the prefactor that scales every plate frequency."""
+    return np.sqrt(flexural_rigidity(E, nu, h) / (rho * h))
+
+
 # ---------- Cartesian helpers ----------
 
 def X_basis(x, n):
@@ -55,9 +75,9 @@ def all_valid_S(max_S=500):
                    for m in range(int(np.sqrt(k)) + 1))]
 
 
-def square_freq(c, a, S):
-    # Plate x,y ∈ [-a, a]; eigenvalue (π/(2a))²·(n²+m²); ω = c·k; f = c·√S/(4a)
-    return c * np.sqrt(S) / (4 * a)
+def square_freq(E, nu, rho, h, a, S):
+    # Biharmonic eigenvalue k² = (π/(2a))²·S; f = (k²/2π)·√(D/ρh) = (πS)/(8a²)·√(D/ρh)
+    return (np.pi * S) / (8.0 * a ** 2) * plate_speed(E, nu, rho, h)
 
 
 # ---------- Polar helpers ----------
@@ -80,9 +100,9 @@ def polar_mode_table(n_max=15, m_max=10):
     return sorted(out, key=lambda x: x[2])
 
 
-def polar_freq(c, a, z):
-    # ω = c·z_nm/a; f = c·z_nm/(2π·a)
-    return c * z / (2 * np.pi * a)
+def polar_freq(E, nu, rho, h, a, z):
+    # Biharmonic: f = z²/(2π·a²)·√(D/ρh)
+    return (z ** 2) / (2.0 * np.pi * a ** 2) * plate_speed(E, nu, rho, h)
 
 
 def f_polar(r, theta):
@@ -124,7 +144,7 @@ def render_one_square(pairs, signs, *, plate_color, contour_color, thickness,
 
     fig, ax = plt.subplots(figsize=figsize)
     if bg_color is None:
-        fig.patch.set_alpha(0)  # transparent — only the plate is visible
+        fig.patch.set_alpha(0)
     else:
         fig.patch.set_facecolor(bg_color)
     ax.set_facecolor(plate_color)
@@ -142,7 +162,7 @@ def render_one_polar(n, m, *, plate_color, contour_color, thickness, figsize=(6,
     T, R, Z = polar_field(n, m)
     fig, ax = plt.subplots(figsize=figsize, subplot_kw={"projection": "polar"})
     if bg_color is None:
-        fig.patch.set_alpha(0)  # transparent — only the disk is visible
+        fig.patch.set_alpha(0)
     else:
         fig.patch.set_facecolor(bg_color)
     ax.set_facecolor(plate_color)
@@ -179,16 +199,18 @@ def parse_freq_list(text):
     return out
 
 
-def square_snap(freq, c, a, valid_S):
-    target_S = (4 * a * freq / c) ** 2
+def square_snap(freq, E, nu, rho, h, a, valid_S):
+    cp = plate_speed(E, nu, rho, h)
+    target_S = 8.0 * a ** 2 * freq / (np.pi * cp)
     S = min(valid_S, key=lambda s: abs(s - target_S))
-    return S, square_freq(c, a, S)
+    return S, square_freq(E, nu, rho, h, a, S)
 
 
-def polar_snap(freq, c, a, nontrivial):
-    target_z = 2 * np.pi * a * freq / c
+def polar_snap(freq, E, nu, rho, h, a, nontrivial):
+    cp = plate_speed(E, nu, rho, h)
+    target_z = float(np.sqrt(max(2.0 * np.pi * a ** 2 * freq / cp, 0.0)))
     n, m, z = min(nontrivial, key=lambda r: abs(r[2] - target_z))
-    return n, m, z, polar_freq(c, a, z)
+    return n, m, z, polar_freq(E, nu, rho, h, a, z)
 
 
 # ---------- UI ----------
@@ -203,13 +225,17 @@ COLOR_OPTIONS = {
 }
 COLOR_NAMES = list(COLOR_OPTIONS)
 
-st.title("Chladni Patterns Generator")
-st.caption("Drive the plate at a real frequency — the closest natural mode lights up.")
+OOB_BG = "#ffd6d6"
 
-view_mode = st.sidebar.radio("View", ["Single frequency", "Frequency list"])
+st.title("Chladni Patterns Generator")
+st.caption("Thin-plate (Kirchhoff–Love) biharmonic model, simply-supported edges.")
+
+view_mode = st.sidebar.radio(
+    "View", ["Single frequency", "Frequency list", "Parameter grid"],
+)
 
 # Slots reserved so the single-mode Hz controls render above the inputs that
-# determine their range. Stay empty in list mode.
+# determine their range. Stay empty in other modes.
 freq_slot = st.sidebar.empty()
 exact_slot = st.sidebar.empty()
 
@@ -219,6 +245,21 @@ if view_mode == "Frequency list":
         help="Comma- or newline-separated integers.",
     )
     n_cols = st.sidebar.slider("Grid columns", 2, 6, 4)
+elif view_mode == "Parameter grid":
+    grid_freq = st.sidebar.number_input(
+        "Target frequency (Hz)", min_value=1, max_value=20000,
+        value=528, step=1,
+    )
+    h_count = st.sidebar.slider("h cells", 2, 9, 5)
+    h_step_mm = st.sidebar.number_input(
+        "Δh per cell (mm)", min_value=0.01, max_value=5.0,
+        value=0.1, step=0.01, format="%.2f",
+    )
+    a_count = st.sidebar.slider("a cells", 2, 9, 5)
+    a_step = st.sidebar.number_input(
+        "Δa per cell (m)", min_value=0.001, max_value=0.5,
+        value=0.005, step=0.001, format="%.3f",
+    )
 
 shape = st.sidebar.radio("Plate shape", ["Square", "Circular"])
 plate_color_name = st.sidebar.radio(
@@ -230,8 +271,25 @@ contour_color_name = st.sidebar.radio(
 thickness = st.sidebar.slider("Line thickness", 0.5, 3.0, 1.5, 0.1)
 
 with st.sidebar.expander("Advanced", expanded=False):
-    c = st.number_input("Wave speed c (m/s)", min_value=1.0, max_value=10000.0,
-                        value=100.0, step=10.0)
+    material_name = st.selectbox(
+        "Material", list(MATERIALS.keys()) + ["Custom"], index=0,
+    )
+    if material_name == "Custom":
+        E = st.number_input("Young's modulus E (GPa)",
+                            min_value=1.0, max_value=1000.0,
+                            value=69.0, step=1.0) * 1e9
+        nu = st.number_input("Poisson's ratio ν",
+                             min_value=0.0, max_value=0.5,
+                             value=0.33, step=0.01)
+        rho = st.number_input("Density ρ (kg/m³)",
+                              min_value=100.0, max_value=20000.0,
+                              value=2700.0, step=100.0)
+    else:
+        preset = MATERIALS[material_name]
+        E, nu, rho = preset["E"], preset["nu"], preset["rho"]
+        st.caption(f"E = {E/1e9:.0f} GPa,  ν = {nu},  ρ = {rho:.0f} kg/m³")
+    h = st.number_input("Thickness h (mm)", min_value=0.1, max_value=20.0,
+                        value=1.0, step=0.1) / 1000.0
     a_label = "Half-side a (m)" if shape == "Square" else "Radius a (m)"
     a = st.number_input(a_label, min_value=0.01, max_value=2.0,
                         value=0.1, step=0.01, format="%.3f")
@@ -242,26 +300,25 @@ contour_color = COLOR_OPTIONS[contour_color_name]
 
 if shape == "Square":
     valid_S = all_valid_S(500)
-    f_min = square_freq(c, a, valid_S[0])
-    f_max = square_freq(c, a, valid_S[-1])
+    f_min = square_freq(E, nu, rho, h, a, valid_S[0])
+    f_max = square_freq(E, nu, rho, h, a, valid_S[-1])
 else:
     table = polar_mode_table()
     nontrivial = [row for row in table if row[2] > 0]
-    f_min = polar_freq(c, a, nontrivial[0][2])
-    f_max = polar_freq(c, a, table[-1][2])
+    f_min = polar_freq(E, nu, rho, h, a, nontrivial[0][2])
+    f_max = polar_freq(E, nu, rho, h, a, table[-1][2])
 
 fmin_i = int(np.floor(f_min))
 fmax_i = max(int(np.ceil(f_max)), fmin_i + 1)
 
 
 if view_mode == "Single frequency":
-    # All resonant frequencies (integer Hz) for the current shape/c/a — used by
-    # the number_input's +/- buttons to step to the next or previous mode rather
-    # than moving by 1 Hz (which usually maps to the same mode anyway).
+    # Resonant frequencies (integer Hz) for the current plate — used by the
+    # number_input's +/- buttons to step to the next or previous mode.
     if shape == "Square":
-        mode_hz = sorted({int(round(square_freq(c, a, S))) for S in valid_S})
+        mode_hz = sorted({int(round(square_freq(E, nu, rho, h, a, S))) for S in valid_S})
     else:
-        mode_hz = sorted({int(round(polar_freq(c, a, z))) for _, _, z in nontrivial})
+        mode_hz = sorted({int(round(polar_freq(E, nu, rho, h, a, z))) for _, _, z in nontrivial})
     mode_hz = [m for m in mode_hz if fmin_i <= m <= fmax_i]
     st.session_state._mode_hz = mode_hz
 
@@ -306,7 +363,7 @@ if view_mode == "Single frequency":
     freq = int(st.session_state._freq_slider)
 
     if shape == "Square":
-        S, actual_freq = square_snap(freq, c, a, valid_S)
+        S, actual_freq = square_snap(freq, E, nu, rho, h, a, valid_S)
         variants = square_variants_for_S(S)
         if len(variants) > 1:
             variant_idx = variant_slot.slider(
@@ -327,10 +384,10 @@ if view_mode == "Single frequency":
         c2.metric("Mode S = n²+m²", str(S))
         c3.metric("Variant", f"{variant_idx + 1} / {len(variants)}")
         st.caption(f"(n,m) pairs: `{pairs}` · signs: `{signs}`")
-        st.caption(r"$f = \dfrac{c}{4a}\sqrt{n^2+m^2}$")
+        st.caption(r"$f = \dfrac{\pi (n^2+m^2)}{8 a^2}\,\sqrt{D/(\rho h)},\quad D = \dfrac{E h^3}{12(1-\nu^2)}$")
 
     else:
-        n, m, z, actual_freq = polar_snap(freq, c, a, nontrivial)
+        n, m, z, actual_freq = polar_snap(freq, E, nu, rho, h, a, nontrivial)
         fig = render_one_polar(n, m, plate_color=plate_color,
                                contour_color=contour_color, thickness=thickness)
         st.pyplot(fig)
@@ -340,9 +397,9 @@ if view_mode == "Single frequency":
         c1.metric("Resonant freq", f"{actual_freq:.1f} Hz")
         c2.metric("(n, m)", f"({n}, {m})")
         c3.metric("Bessel zero z_{n,m}", f"{z:.3f}")
-        st.caption(r"$f = \dfrac{c \, z_{n,m}}{2\pi a}$")
+        st.caption(r"$f = \dfrac{z_{n,m}^2}{2\pi a^2}\,\sqrt{D/(\rho h)}$")
 
-else:
+elif view_mode == "Frequency list":
     # ---------- Frequency list view ----------
     freqs = parse_freq_list(freq_text)
     if not freqs:
@@ -361,7 +418,6 @@ else:
                 f"</div>",
                 unsafe_allow_html=True,
             )
-        OOB_BG = "#ffd6d6"
 
         for row_start in range(0, len(freqs), n_cols):
             row = st.columns(n_cols)
@@ -370,7 +426,7 @@ else:
                     is_oob = target in oob_set
                     bg = OOB_BG if is_oob else None
                     if shape == "Square":
-                        S, actual_freq = square_snap(target, c, a, valid_S)
+                        S, actual_freq = square_snap(target, E, nu, rho, h, a, valid_S)
                         variants = square_variants_for_S(S)
                         key = f"vidx_sq_{target}"
                         idx = st.session_state.get(key, 0) % max(1, len(variants))
@@ -383,7 +439,7 @@ else:
                         sub = f"S={S} · {idx + 1}/{len(variants)}"
                         n_variants = len(variants)
                     else:
-                        n, m, z, actual_freq = polar_snap(target, c, a, nontrivial)
+                        n, m, z, actual_freq = polar_snap(target, E, nu, rho, h, a, nontrivial)
                         key = f"vidx_pol_{n}_{m}"
                         fig = render_one_polar(
                             n, m,
@@ -410,3 +466,65 @@ else:
                                            use_container_width=True):
                             st.session_state[key] = (idx + 1) % n_variants
                             st.rerun()
+
+else:
+    # ---------- Parameter grid view ----------
+    # Sweep (h, a) over a cartesian product centered on the Advanced inputs,
+    # rendering the snapped pattern at `grid_freq` for every (h, a) cell.
+    h_step = h_step_mm / 1000.0
+    h_offsets = (np.arange(h_count) - (h_count - 1) / 2.0) * h_step
+    a_offsets = (np.arange(a_count) - (a_count - 1) / 2.0) * a_step
+    h_values = [round(float(h + x), 6) for x in h_offsets if 0.0001 <= h + x <= 0.02]
+    a_values = [round(float(a + x), 3) for x in a_offsets if 0.01 <= a + x <= 2.0]
+
+    if not h_values or not a_values:
+        st.info("Sweep stepped outside the allowed range — reduce Δh or Δa.")
+    else:
+        st.markdown(
+            f"Target **{grid_freq} Hz** · {material_name} · "
+            f"center h = {h*1000:.2f} mm, a = {a:.3f} m · "
+            f"sweeping {len(h_values)} × {len(a_values)} = "
+            f"{len(h_values) * len(a_values)} cells"
+        )
+
+        if shape == "Circular":
+            z_max = nontrivial[-1][2]
+            z_min = nontrivial[0][2]
+
+        for a_val in a_values:
+            row = st.columns(len(h_values))
+            for col, h_val in zip(row, h_values):
+                with col:
+                    if shape == "Square":
+                        f_min_cell = square_freq(E, nu, rho, h_val, a_val, valid_S[0])
+                        f_max_cell = square_freq(E, nu, rho, h_val, a_val, valid_S[-1])
+                        is_oob = grid_freq < f_min_cell or grid_freq > f_max_cell
+                        bg = OOB_BG if is_oob else None
+                        S, actual = square_snap(grid_freq, E, nu, rho, h_val, a_val, valid_S)
+                        pairs, signs = square_variants_for_S(S)[0]
+                        fig = render_one_square(
+                            pairs, signs,
+                            plate_color=plate_color, contour_color=contour_color,
+                            thickness=thickness, figsize=(2.4, 2.4), bg_color=bg,
+                        )
+                        sub = f"S={S}"
+                    else:
+                        f_min_cell = polar_freq(E, nu, rho, h_val, a_val, z_min)
+                        f_max_cell = polar_freq(E, nu, rho, h_val, a_val, z_max)
+                        is_oob = grid_freq < f_min_cell or grid_freq > f_max_cell
+                        bg = OOB_BG if is_oob else None
+                        n, m, z, actual = polar_snap(grid_freq, E, nu, rho, h_val, a_val, nontrivial)
+                        fig = render_one_polar(
+                            n, m,
+                            plate_color=plate_color, contour_color=contour_color,
+                            thickness=thickness, figsize=(2.4, 2.4), bg_color=bg,
+                        )
+                        sub = f"({n},{m})"
+
+                    prefix = "🚨 " if is_oob else ""
+                    st.markdown(
+                        f"{prefix}**h={h_val*1000:.2f} mm, a={a_val:.3f}**  \n"
+                        f"{actual:.0f} Hz · {sub}"
+                    )
+                    st.pyplot(fig)
+                    plt.close(fig)
